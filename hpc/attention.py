@@ -145,6 +145,72 @@ def attention_with_kvcache_prefill_bf16(
     )
 
 
+def attention_with_kvcache_blocksparse_anyorderskip_prefill_bf16(
+    q: Tensor,
+    kcache: Tensor,
+    vcache: Tensor,
+    cu_seqlens_q: Tensor,
+    block_ids: Tensor,
+    seqlens_kvcache: Tensor,
+    max_seqlens_q: int,
+    row_blockmask: Tensor,
+    threshold: float = -1.0,
+    output: Tensor = None,
+) -> Tensor:
+    """Any-order block-sparse prefill (paged BF16 KV cache) with dynamic threshold skip.
+
+    This op consumes an *ordered* int32 K-block list per row and walks the KV blocks in
+    exactly that order. It additionally supports BLASST-style running-max threshold skipping
+    that drops low-contribution KV tiles at runtime (PV compute is skipped; K/V TMA reads are
+    not).
+
+    Two features that are designed to be used together:
+
+    - Any-order (row-list): ``row_blockmask`` holds, for each (batch, head, local q-tile), the
+      logical K-block indices to compute in order, terminated by the first ``-1``. Example:
+      ``[7, 4, 5, 8, -1, -1, ...]`` computes ``q x k_7, q x k_4, q x k_5, q x k_8``.
+    - Threshold skip: for each non-diagonal tile, the running max ``delta_s`` is compared with a
+      per-batch ``log2_threshold`` computed in-kernel from ``threshold``.
+
+    Causality is the caller's responsibility (the diagonal tile uses an element-wise causal mask
+    and is exempt from threshold skip). Keep the diagonal tile in each row-list to avoid a Q-tile
+    with zero active tiles producing softmax(all -inf) = NaN.
+
+    Args:
+        q: Query tensor. Shape: [total_seq, num_head_q, num_dim_qk], Dtype: bfloat16
+        kcache: Paged K cache. Logical shape:
+            [num_blocks, block_size, num_head_kv, num_dim_qk]. Dtype: bfloat16
+        vcache: Paged V cache. Logical shape:
+            [num_blocks, block_size, num_head_kv, num_dim_v]. Dtype: bfloat16
+        cu_seqlens_q: Cumulative Q lengths. Shape: [num_batch + 1], Dtype: int32
+        block_ids: Page table. Shape: [num_batch, max_blocks], Dtype: int32
+        seqlens_kvcache: KV cache lengths. Shape: [num_batch], Dtype: int32
+        max_seqlens_q: Max Q sequence length (scalar).
+        row_blockmask: Ordered logical K-block indices, ``-1`` padded. Shape:
+            [num_batch, num_head_q, ceil(max_seqlens_q / 128), num_k_block], Dtype: int32.
+            The K-block granularity is kTileN=128 (num_k_block = ceil(max_kv_len / 128)).
+        threshold: Raw scale factor. ``< 0`` disables skipping; ``>= 0`` enables it (``0`` is
+            equivalent to no skipping). Converted in-kernel per batch as
+            ``log2(min(threshold / num_seq_kv, 0.1))``.
+        output: Optional pre-allocated output tensor.
+
+    Returns:
+        Tensor: Shape [total_seq, num_head_q, num_dim_v], Dtype: bfloat16.
+    """
+    return torch.ops.hpc.attention_with_kvcache_blocksparse_anyorderskip_prefill_bf16(
+        q,
+        kcache,
+        vcache,
+        cu_seqlens_q,
+        block_ids,
+        seqlens_kvcache,
+        max_seqlens_q,
+        row_blockmask,
+        threshold,
+        output,
+    )
+
+
 def attention_with_kvcache_prefill_fp8(
     q: Tensor,
     kcache: Tensor,
@@ -704,6 +770,24 @@ def attention_prefill_bf16_fake(q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q,
 @torch.library.register_fake("hpc::attention_with_kvcache_prefill_bf16")
 def attention_with_kvcache_prefill_bf16_fake(
     q, kcache, vcache, cu_seqlens_q, block_ids, seqlens_kvcache, max_seqlens_q, output
+):
+    return torch.empty(
+        (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device
+    )
+
+
+@torch.library.register_fake("hpc::attention_with_kvcache_blocksparse_anyorderskip_prefill_bf16")
+def attention_with_kvcache_blocksparse_anyorderskip_prefill_bf16_fake(
+    q,
+    kcache,
+    vcache,
+    cu_seqlens_q,
+    block_ids,
+    seqlens_kvcache,
+    max_seqlens_q,
+    row_blockmask,
+    threshold=-1.0,
+    output=None,
 ):
     return torch.empty(
         (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device

@@ -963,6 +963,537 @@ __global__ void __launch_bounds__(384, 1)
   }
 }
 
+// BF16 warp-specialization kernel: any-order KV row-list + dynamic threshold skip, paged KV
+// cache, dim_qk=128, dim_v=128.
+// - row_blockmask_ptr: int32 ordered logical K-block indices per (batch, head, q-tile), -1 = end.
+// - threshold: raw scale factor; < 0 disables skip; >= 0 enables (converted per-batch in-kernel).
+template <typename Config, typename TmaQ, typename TmaK, typename TmaV, typename TmaY>
+__global__ void __launch_bounds__(384, 1)
+    attention_with_kvcache_blocksparse_anyorderskip_prefill_bf16_warp_specialization_kernel(
+        cute::TmaDescriptor *td_qy, const __grid_constant__ TmaK tma_k,
+        const __grid_constant__ TmaV tma_v, const int *cu_seqlens_q_ptr,
+        const int *seqlens_kvcache_ptr, const int *block_ids_ptr, int num_batch, int max_seq_q,
+        int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
+        int block_size, int num_seq_max_blocks, float one_over_dk_log2e,
+        cutlass::FastDivmod head_kv_divmod, cutlass::FastDivmod head_q_divmod,
+        cutlass::FastDivmod tile_m_divmod, const int32_t *row_blockmask_ptr,
+        int num_k_block_in_mask, float threshold) {
+  using namespace cute;  // NOLINT
+
+  using Tin = typename Config::Tin;
+  using Tout = typename Config::Tout;
+  using TiledMmaQK = typename Config::TiledMmaQK;
+  using TiledMmaPV = typename Config::TiledMmaPV;
+  using SLayoutQ = typename Config::SLayoutQ;
+  using SLayoutK = typename Config::SLayoutK;
+  using SLayoutV = typename Config::SLayoutV;
+  using SLayoutY = typename Config::SLayoutY;
+
+  constexpr int kTileM = Config::kTileM;
+  constexpr int kTileN = Config::kTileN;
+  constexpr int kTileK = Config::kTileK;
+  constexpr int kTileV = Config::kTileV;
+  constexpr int kStage = Config::kStage;
+  constexpr int kBlockSize = Config::kBlockSize;
+
+  int idx = threadIdx.x;
+  int iblock = blockIdx.x;
+
+  int elected = cute::elect_one_sync();
+  int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
+  bool is_leader_in_block = (iwarp == 0) && elected;
+  bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
+
+  __shared__ uint64_t readable_q;
+  __shared__ uint64_t writable_q;
+  __shared__ uint64_t readable_list;
+  __shared__ uint64_t writable_list;
+  __shared__ uint64_t readable_k[kStage];
+  __shared__ uint64_t writable_k[kStage];
+  __shared__ uint64_t readable_v[kStage];
+  __shared__ uint64_t writable_v[kStage];
+  extern __shared__ uint8_t shm_data[] alignas(128);
+
+  auto *shm_q = reinterpret_cast<Tin *>(shm_data);
+  auto *shm_k = shm_q + cosize(SLayoutQ{});
+  auto *shm_v = shm_k + cosize(SLayoutK{});
+  auto *shm_y = reinterpret_cast<Tout *>(shm_v + cosize(SLayoutV{}));
+  auto *shm_seqlens_q = reinterpret_cast<int *>(shm_y + cosize(SLayoutY{}));
+  auto *shm_seqlens_kv = shm_seqlens_q + num_batch;
+  auto *shm_seqlens_qstart = shm_seqlens_kv + num_batch;
+  // Active tile list: [num_tile_active (int)] [tile_indices (int[])]
+  auto *shm_num_active = reinterpret_cast<int *>(shm_seqlens_qstart + num_batch);
+  auto *shm_active_tiles = shm_num_active + 1;
+  // Per-warp skip vote slots for the warpgroup-wide AND reduction (2 warpgroups x 4 warps).
+  auto *skip_vote = reinterpret_cast<uint32_t *>(shm_active_tiles + num_k_block_in_mask + 1);
+
+  TmaQ tma_q;
+  TmaY tma_y;
+
+  // Tensor Q/K/V/Y
+  auto gQ = tma_q.get_tma_tensor(make_shape(max_seq_q, num_dim_qk, num_head_q));
+  auto gK =
+      tma_k.get_tma_tensor(make_shape(kBlockSize, num_dim_qk, num_head_kv, num_kvcache_blocks));
+  auto gV =
+      tma_v.get_tma_tensor(make_shape(num_dim_v, kBlockSize, num_head_kv, num_kvcache_blocks));
+  auto gY = tma_y.get_tma_tensor(make_shape(max_seq_q, num_dim_v, num_head_q));
+
+  auto gAtt =
+      make_tensor(make_gmem_ptr(static_cast<float *>(nullptr)),
+                  make_shape(Int<kTileM>{}, Int<kTileN>{}), make_stride(Int<kTileN>{}, Int<1>{}));
+  auto gYY =
+      make_tensor(make_gmem_ptr(static_cast<Tout *>(nullptr)),
+                  make_shape(Int<kTileM>{}, Int<kTileV>{}), make_stride(Int<kTileV>{}, Int<1>{}));
+
+  // Tensor sQ/sK/sV
+  auto sQ = make_tensor(make_smem_ptr(shm_q), SLayoutQ{});
+  auto sK = make_tensor(make_smem_ptr(shm_k), SLayoutK{});
+  auto sV = make_tensor(make_smem_ptr(shm_v), SLayoutV{});
+  auto sY = make_tensor(make_smem_ptr(shm_y), SLayoutY{});
+
+  // Block Level tma
+  auto btma_q = tma_q.get_slice(0);
+  auto btma_k = tma_k.get_slice(0);
+  auto btma_v = tma_v.get_slice(0);
+  auto btma_y = tma_y.get_slice(0);
+
+  // Thread Level Tensor
+  auto tQg = btma_q.partition_S(gQ);  // (TMA, TMA_M, TMA_K, head, batch)
+  auto tKg = btma_k.partition_S(gK);  // (TMA, TMA_N, TMA_K, head, batch)
+  auto tVg = btma_v.partition_S(gV);  // (TMA, TMA_V, TMA_N, head, batch)
+
+  auto tQs = btma_q.partition_D(sQ);  // (TMA, _1, _1)
+  auto tKs = btma_k.partition_D(sK);  // (TMA, _1, _1, kStage)
+  auto tVs = btma_v.partition_D(sV);  // (TMA, _1, _1, kStage)
+
+  TiledMmaQK tiled_mma_qk;
+  TiledMmaPV tiled_mma_pv;
+
+  auto thr_mma_qk = tiled_mma_qk.get_slice(idx);
+  auto thr_mma_pv = tiled_mma_pv.get_slice(idx);
+
+  auto tQs4r = thr_mma_qk.partition_A(sQ);
+  auto tKs4r = thr_mma_qk.partition_B(sK);
+  auto tVs4r = thr_mma_pv.partition_B(sV);
+
+  auto tQr = thr_mma_qk.make_fragment_A(tQs4r);  // (MMA, MMA_M, MMA_K)
+  auto tKr = thr_mma_qk.make_fragment_B(tKs4r);  // (MMA, MMA_N, MMA_K)
+  auto tVr = thr_mma_pv.make_fragment_B(tVs4r);  // (MMA, MMA_V, MMA_N)
+
+  auto tAttr = thr_mma_qk.partition_fragment_C(gAtt);
+  auto tYr = thr_mma_pv.partition_fragment_C(gYY);
+
+  // init k/v barrier
+  if (is_leader_in_block) {
+    initialize_barrier(readable_q, 1);
+    initialize_barrier(writable_q, 2);
+    initialize_barrier(readable_list, 32);
+    initialize_barrier(writable_list, 256);
+#pragma unroll
+    for (int i = 0; i < kStage; ++i) {
+      initialize_barrier(readable_k[i], 1);
+      initialize_barrier(writable_k[i], 2);
+      initialize_barrier(readable_v[i], 1);
+      initialize_barrier(writable_v[i], 2);
+    }
+  }
+
+  for (int i = idx; i < num_batch; i += blockDim.x) {
+    int num_seq_ibatch = cu_seqlens_q_ptr[i + 1] - cu_seqlens_q_ptr[i];
+    shm_seqlens_q[i] = num_seq_ibatch;
+    shm_seqlens_kv[i] = seqlens_kvcache_ptr[i];
+    shm_seqlens_qstart[i] = seqlens_kvcache_ptr[i] - num_seq_ibatch;
+  }
+
+  // sync to avoid ahead thread use(wait) readable when it is not initizlized yet
+  __syncthreads();
+
+  int max_num_tile_m = (max_seq_q + kTileM - 1) / kTileM;
+  int max_total_blocks = num_head_q * num_batch * max_num_tile_m;
+
+  constexpr int kNumBlockPerTileN = kTileN / kBlockSize;
+
+  // Producer Warpgroup
+  if (idx >= 256) {
+    cutlass::arch::warpgroup_reg_dealloc<24>();
+    idx -= 256;
+
+    int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
+
+    // 32 lanes enter; the ordered list is copied by a single elected lane to preserve order.
+    if (iwarp == 0) {
+      int phase = 1;         // start with ok
+      int phase_q = 1;       // start with ok
+      int phase_list_w = 1;  // start with ok
+      int ismem_write = 0;
+
+      while (true) {
+        if (iblock >= max_total_blocks) {
+          break;
+        }
+
+        auto [itile_m, ihead_q, ibatch] =
+            get_next_tile<kTileM>(shm_seqlens_q, iblock, num_head_q, num_batch, max_total_blocks,
+                                  max_num_tile_m, head_q_divmod, tile_m_divmod);
+
+        int num_seq_kv = seqlens_kvcache_ptr[ibatch];
+        if (itile_m < 0) {
+          continue;
+        }
+
+        int ihead_kv, res;
+        head_kv_divmod(ihead_kv, res, ihead_q);
+
+        auto *td_q = td_qy + ibatch * 2;
+
+        auto *block_ids_ibatch_ptr = block_ids_ptr + ibatch * num_seq_max_blocks;
+
+        // Load Q
+        wait_barrier(writable_q, phase_q);
+        if (elected) {
+          cute::copy(tma_q.with(td_q, readable_q), tQg(_, itile_m, _, ihead_q), tQs(_, 0, _));
+        }
+
+        int num_blocks = (num_seq_kv + kBlockSize - 1) / kBlockSize;
+        constexpr int kTransactionBytesK = sizeof(Tin) * kTileN * kTileK;
+        constexpr int kTransactionBytesV = sizeof(Tin) * kTileV * kTileN;
+
+        // Build active tile list from the ordered int32 row-list (stop at first -1).
+        wait_barrier(writable_list, phase_list_w);
+        phase_list_w ^= 1;
+
+        int row_off = (ibatch * num_head_q + ihead_q) * (max_num_tile_m * num_k_block_in_mask) +
+                      itile_m * num_k_block_in_mask;
+        if (elected) {
+          int n = 0;
+#pragma unroll 1
+          for (int j = 0; j < num_k_block_in_mask; ++j) {
+            int v = row_blockmask_ptr[row_off + j];
+            if (v < 0) {
+              break;
+            }
+            shm_active_tiles[n] = v;
+            ++n;
+          }
+          *shm_num_active = n;
+        }
+        __syncwarp();
+        int num_tile_active = *shm_num_active;
+        arrive_barrier(readable_list);
+
+        if (elected) {
+          set_barrier_transaction_bytes(readable_q, sizeof(Tin) * cosize(SLayoutQ{}));
+        }
+        phase_q ^= 1;
+
+#pragma unroll 1
+        for (int i_active = 0; i_active < num_tile_active; ++i_active) {
+          int itile_seq_kv = shm_active_tiles[i_active];
+
+          // k
+          wait_barrier(writable_k[ismem_write], phase);
+
+          int iblock_ids[kNumBlockPerTileN];
+#pragma unroll
+          for (int iblock_kv = 0; iblock_kv < kNumBlockPerTileN; iblock_kv++) {
+            iblock_ids[iblock_kv] = -1;
+            int iblock_id = itile_seq_kv * kNumBlockPerTileN + iblock_kv;
+            if (iblock_id < num_blocks) {
+              iblock_ids[iblock_kv] = block_ids_ibatch_ptr[iblock_id];
+            }
+          }
+
+          if (elected) {
+#pragma unroll
+            for (int iblock_kv = 0; iblock_kv < kNumBlockPerTileN; iblock_kv++) {
+              int iblock_true = iblock_ids[iblock_kv];
+              cute::copy(tma_k.with(readable_k[ismem_write]), tKg(_, 0, _, ihead_kv, iblock_true),
+                         tKs(_, iblock_kv, _, ismem_write));
+            }
+            set_barrier_transaction_bytes(readable_k[ismem_write], kTransactionBytesK);
+          }
+
+          // v
+          wait_barrier(writable_v[ismem_write], phase);
+          if (elected) {
+#pragma unroll
+            for (int iblock_kv = 0; iblock_kv < kNumBlockPerTileN; iblock_kv++) {
+              int iblock_true = iblock_ids[iblock_kv];
+              cute::copy(tma_v.with(readable_v[ismem_write]), tVg(_, _, 0, ihead_kv, iblock_true),
+                         tVs(_, _, iblock_kv, ismem_write));
+            }
+            set_barrier_transaction_bytes(readable_v[ismem_write], kTransactionBytesV);
+          }
+
+          ++ismem_write;
+          if (ismem_write == kStage) {
+            ismem_write = 0;
+            phase ^= 1;
+          }
+        }
+        __syncwarp();
+      }
+    }
+  } else {  // Consumer Warpgroup
+    cutlass::arch::warpgroup_reg_alloc<168>();
+
+    int idx_in_warpgroup = idx % 128;
+    int iwarpgroup = idx / 128;
+    int iwarp_in_warpgroup = idx_in_warpgroup / 32;
+    int elected_idx_in_warpgroup = ((iwarp_in_warpgroup == 0) && elected);
+
+    auto layout_asC = thr_mma_qk.partition_C(gAtt).layout();
+    auto layout_asA = thr_mma_pv.partition_A(gAtt).layout();
+    auto tAttA = make_tensor(tAttr.data(), left_inverse(layout_asC).compose(layout_asA));
+
+    auto gI = make_identity_tensor(gAtt.shape());
+    auto tI = thr_mma_qk.partition_C(gI);
+
+    auto tAttr_mn = retile_fragment(tAttr);
+    constexpr int kM = size<0>(tAttr_mn);
+    constexpr int kN = size<1>(tAttr_mn);
+    Tensor gMax = make_tensor<float>(Int<kM>{});
+    Tensor gSum = make_tensor<float>(Int<kM>{});
+
+    tiled_mma_pv.accumulate_ = GMMA::ScaleOut::One;
+
+    int ismem_read = 0;
+    int phase = 0;
+    int phase_q = 0;
+    int phase_list = 0;
+
+    while (true) {
+      if (iblock >= max_total_blocks) {
+        break;
+      }
+
+      auto [itile_m, ihead_q, ibatch] =
+          get_next_tile<kTileM>(shm_seqlens_q, iblock, num_head_q, num_batch, max_total_blocks,
+                                max_num_tile_m, head_q_divmod, tile_m_divmod);
+
+      if (itile_m < 0) {
+        continue;
+      }
+
+      int num_seq_kv = shm_seqlens_kv[ibatch];
+      int start_seq_q = shm_seqlens_qstart[ibatch];
+
+      int ihead_kv, res;
+      head_kv_divmod(ihead_kv, res, ihead_q);
+      int num_tile_full = (start_seq_q + itile_m * kTileM) / kTileN;
+
+      // Threshold conversion in-kernel, per batch (num_seq_kv differs per batch).
+      // threshold < 0 => disabled (log2_threshold = -inf => delta_s < -inf is always false).
+      bool thresh_enabled = (threshold >= 0.f);
+      float log2_threshold = thresh_enabled
+                                 ? log2f(fminf(threshold / static_cast<float>(num_seq_kv), 0.1f))
+                                 : -std::numeric_limits<float>::infinity();
+
+      clear(tYr);
+      clear(gSum);
+      fill(gMax, -std::numeric_limits<float>::infinity());
+
+      wait_barrier(readable_q, phase_q);
+
+      wait_barrier(readable_list, phase_list);
+      phase_list ^= 1;
+      int num_tile_active = *shm_num_active;
+
+#pragma unroll 1
+      for (int i_active = 0; i_active < num_tile_active; ++i_active) {
+        int itile_seq_kv = shm_active_tiles[i_active];
+
+        wait_barrier(readable_k[ismem_read], phase);
+
+        // P = QK
+        tiled_mma_qk.accumulate_ = GMMA::ScaleOut::Zero;
+
+        warpgroup_fence_operand(tAttr);
+        warpgroup_arrive();
+#pragma unroll
+        for (int ik = 0; ik < size<2>(tQr); ++ik) {
+          cute::gemm(tiled_mma_qk, tQr(_, _, ik), tKr(_, _, ik, ismem_read), tAttr(_, _, _));
+          tiled_mma_qk.accumulate_ = GMMA::ScaleOut::One;
+        }
+
+        warpgroup_commit_batch();
+        warpgroup_wait<0>();
+        warpgroup_fence_operand(tAttr);
+
+        if (elected_idx_in_warpgroup) {
+          arrive_barrier(writable_k[ismem_read]);
+        }
+
+        if (i_active == (num_tile_active - 1)) {
+          if (elected_idx_in_warpgroup) {
+            arrive_barrier(writable_q);
+          }
+          phase_q ^= 1;
+          arrive_barrier(writable_list);
+        }
+
+        bool is_diag = (itile_seq_kv >= num_tile_full);
+
+        // do causal mask (diagonal tiles only; non-diag tiles are fully valid)
+        auto tI_mn = retile_fragment(tI);
+        if (is_diag) {
+#pragma unroll
+          for (int im = 0; im < kM; ++im) {
+#pragma unroll
+            for (int in = 0; in < kN; ++in) {
+              int irow = start_seq_q + itile_m * kTileM + get<0>(tI_mn(im, in));
+              int icol = itile_seq_kv * kTileN + get<1>(tI_mn(im, in));
+
+              if ((icol > irow) || (icol >= num_seq_kv)) {
+                tAttr_mn(im, in) = -std::numeric_limits<float>::infinity();
+              }
+            }
+          }
+        }
+
+        // Threshold skip decision: scaled, base-2, pre-exp; diagonal tiles are exempt.
+        // Decision must be uniform across BOTH consumer warpgroups (the whole 128-row Q-tile),
+        // matching Triton's single `delta_s = max_row(delta over 128 rows) < T` test. So every
+        // one of the 256 consumer threads must end up with a byte-identical `skip`. Each warp
+        // ANDs its own rows, then we broadcast all 8 warp votes (2 warpgroups x 4 warps) through
+        // SMEM vote slots and AND all 8: a tile is skipped only when ALL 128 rows are below T.
+        bool skip = false;
+        if (thresh_enabled && !is_diag) {
+          bool warp_skip = true;  // AND over this thread's rows
+#pragma unroll
+          for (int im = 0; im < kM; ++im) {
+            float row_max = tAttr_mn(im, 0);
+#pragma unroll
+            for (int in = 1; in < kN; ++in) {
+              row_max = fmaxf(row_max, tAttr_mn(im, in));
+            }
+            // Same scaling as online_softmax: max(qk) * one_over_dk_log2e (base-2, pre-exp).
+            row_max = warp_4lane_reduce_max_xor(row_max) * one_over_dk_log2e;
+            warp_skip &= ((row_max - gMax(im)) < log2_threshold);
+          }
+          // Hardware warp-wide AND: all 32 lanes of the warp get the SAME value.
+          warp_skip = __all_sync(0xFFFFFFFF, warp_skip);
+
+          // Use a safe named-barrier id (>= 8): id 0 is shared with __syncthreads
+          // and 1-7 are reserved by CUTLASS, which causes nondeterministic hangs.
+          // id 8/9 are used by the per-warpgroup epilogue store barrier, so use id 10
+          // here for the cross-warpgroup (all 256 consumer threads) vote. Both warpgroups
+          // advance in lockstep over the same i_active tile and compute identical is_diag /
+          // thresh_enabled, so both always reach this barrier together (no deadlock).
+          // B1: ensure the previous tile's vote reads are done before overwriting slots.
+          asm volatile("barrier.sync 10, 256;\n" ::: "memory");
+          if (elected) {
+            reinterpret_cast<volatile uint32_t *>(skip_vote)[iwarpgroup * 4 + iwarp_in_warpgroup] =
+                warp_skip ? 1u : 0u;
+          }
+          __threadfence_block();
+          // B2: all 8 warp votes (both warpgroups) visible before the block-wide read.
+          asm volatile("barrier.sync 10, 256;\n" ::: "memory");
+
+          // Volatile read forces a fresh SMEM load (no caching) so all 256 threads see the
+          // same 8 slots and compute an identical `skip` over the full 128-row Q-tile.
+          volatile uint32_t *v = skip_vote;
+          uint32_t all_skip = v[0] & v[1] & v[2] & v[3] & v[4] & v[5] & v[6] & v[7];
+          skip = (all_skip != 0u);
+        }
+
+        if (skip) {
+          // Free the V stage and advance the pipeline; never touch m/l/acc.
+          wait_barrier(readable_v[ismem_read], phase);
+          if (elected_idx_in_warpgroup) {
+            arrive_barrier(writable_v[ismem_read]);
+          }
+          ++ismem_read;
+          if (ismem_read == kStage) {
+            phase ^= 1;
+            ismem_read = 0;
+          }
+          continue;
+        }
+
+        auto tYr_mn = retile_fragment(tYr);
+        // online softmax
+        online_softmax(tAttr_mn, gMax, gSum, tYr_mn, kM, kN, one_over_dk_log2e);
+
+        // Y = PV
+        auto tAttAbf16 = make_tensor_like<cute::bfloat16_t>(tAttA);
+#pragma unroll
+        for (int i = 0; i < size(tAttA); ++i) {
+          tAttAbf16(i) = static_cast<cute::bfloat16_t>(tAttA(i));
+        }
+
+        wait_barrier(readable_v[ismem_read], phase);
+
+        warpgroup_fence_operand(tYr);
+        warpgroup_arrive();
+        cute::gemm(tiled_mma_pv, tAttAbf16, tVr(_, _, _, ismem_read), tYr);
+        warpgroup_commit_batch();
+        warpgroup_wait<0>();
+
+        if (elected_idx_in_warpgroup) {
+          arrive_barrier(writable_v[ismem_read]);
+        }
+
+        ++ismem_read;
+        if (ismem_read == kStage) {
+          phase ^= 1;
+          ismem_read = 0;
+        }
+      }
+
+      // Release Q barrier to prevent deadlock if the row-list is empty.
+      if (num_tile_active == 0) {
+        if (elected_idx_in_warpgroup) {
+          arrive_barrier(writable_q);
+        }
+        phase_q ^= 1;
+        arrive_barrier(writable_list);
+      }
+
+      auto tYr_mn = retile_fragment(tYr);
+      // final online softmax
+      final_online_softmax(tYr_mn, gSum, kM);
+
+      // to bfloat16
+      auto tYr_bf16 = make_tensor_like<Tout>(tYr);
+
+#pragma unroll
+      for (int i = 0; i < size(tYr); ++i) {
+        Tout v{tYr(i)};
+        tYr_bf16(i) = v;
+      }
+
+      // Epilogue: write register-C to global memory
+      using R2SCopyAtomC = Copy_Atom<cute::SM90_U32x4_STSM_N, Tout>;
+      auto r2s_tiled_copy = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma_pv);
+      auto r2s_thr_copy = r2s_tiled_copy.get_slice(idx);
+
+      auto tYr4s = r2s_thr_copy.retile_S(tYr_bf16);
+      auto tYs4r = r2s_thr_copy.partition_D(sY);
+
+      cute::copy(r2s_tiled_copy, tYr4s, tYs4r);
+      // Safe named-barrier id (>= 8) to avoid conflicts with id 0 (__syncthreads)
+      // and CUTLASS-reserved ids 1-7.
+      asm volatile("barrier.sync %0, 128;\n" ::"r"(iwarpgroup + 8) : "memory");
+      tma_store_fence();
+
+      // using TMA to store
+      if (is_leader_in_warpgroup) {
+        auto cY = tma_y.get_tma_tensor(make_shape(max_seq_q, num_dim_v, num_head_q));
+        auto btma_y = tma_y.get_slice(0);
+
+        auto tYss = btma_y.partition_S(sY);  // (TMA, TMA_M, TMA_N)
+        auto tYgg = btma_y.partition_D(cY);  // (TMA, TMA_M, TMA_N, b)
+
+        auto *td_y = td_qy + ibatch * 2 + 1;
+        cute::copy(tma_y.with(td_y), tYss(_, iwarpgroup, 0),
+                   tYgg(_, itile_m * 2 + iwarpgroup, 0, ihead_q));
+        tma_store_arrive();
+      }
+    }
+  }
+}
+
 template <typename Config, typename TmaQ, typename TmaK, typename TmaV, typename TmaY,
           typename TmaQS>
 __global__ void __launch_bounds__(384, 1)
