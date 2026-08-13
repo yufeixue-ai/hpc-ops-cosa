@@ -1186,6 +1186,10 @@ __global__ void __launch_bounds__(384, 1)
         }
         phase_q ^= 1;
 
+        int start_seq_q_p = shm_seqlens_qstart[ibatch];
+        int num_tile_full_p = (start_seq_q_p + itile_m * kTileM) / kTileN;
+        bool thresh_enabled_p = (threshold >= 0.f);
+
 #pragma unroll 1
         for (int i_active = 0; i_active < num_tile_active; ++i_active) {
           int itile_seq_kv = shm_active_tiles[i_active];
@@ -1229,6 +1233,12 @@ __global__ void __launch_bounds__(384, 1)
           if (ismem_write == kStage) {
             ismem_write = 0;
             phase ^= 1;
+          }
+
+          bool is_diag_p = (itile_seq_kv >= num_tile_full_p);
+          if (thresh_enabled_p && !is_diag_p) {
+            asm volatile("barrier.sync 10, 288;\n" ::: "memory");
+            asm volatile("barrier.sync 10, 288;\n" ::: "memory");
           }
         }
         __syncwarp();
@@ -1374,27 +1384,16 @@ __global__ void __launch_bounds__(384, 1)
           // Hardware warp-wide AND: all 32 lanes of the warp get the SAME value.
           warp_skip = __all_sync(0xFFFFFFFF, warp_skip);
 
-          // Use a safe named-barrier id (>= 8): id 0 is shared with __syncthreads
-          // and 1-7 are reserved by CUTLASS, which causes nondeterministic hangs.
-          // id 8/9 are used by the per-warpgroup epilogue store barrier, so use id 10
-          // here for the cross-warpgroup (all 256 consumer threads) vote. Both warpgroups
-          // advance in lockstep over the same i_active tile and compute identical is_diag /
-          // thresh_enabled, so both always reach this barrier together (no deadlock).
-          // B1: ensure the previous tile's vote reads are done before overwriting slots.
-          asm volatile("barrier.sync 10, 256;\n" ::: "memory");
           if (elected) {
             reinterpret_cast<volatile uint32_t *>(skip_vote)[iwarpgroup * 4 + iwarp_in_warpgroup] =
                 warp_skip ? 1u : 0u;
           }
           __threadfence_block();
-          // B2: all 8 warp votes (both warpgroups) visible before the block-wide read.
-          asm volatile("barrier.sync 10, 256;\n" ::: "memory");
-
-          // Volatile read forces a fresh SMEM load (no caching) so all 256 threads see the
-          // same 8 slots and compute an identical `skip` over the full 128-row Q-tile.
+          asm volatile("barrier.sync 10, 288;\n" ::: "memory");
           volatile uint32_t *v = skip_vote;
           uint32_t all_skip = v[0] & v[1] & v[2] & v[3] & v[4] & v[5] & v[6] & v[7];
           skip = (all_skip != 0u);
+          asm volatile("barrier.sync 10, 288;\n" ::: "memory");
         }
 
         if (skip) {
