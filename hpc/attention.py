@@ -145,7 +145,7 @@ def attention_with_kvcache_prefill_bf16(
     )
 
 
-def attention_with_kvcache_blocksparse_anyorderskip_prefill_bf16(
+def attention_with_kvcache_blocksparse_prefill_bf16(
     q: Tensor,
     kcache: Tensor,
     vcache: Tensor,
@@ -153,51 +153,68 @@ def attention_with_kvcache_blocksparse_anyorderskip_prefill_bf16(
     block_ids: Tensor,
     seqlens_kvcache: Tensor,
     max_seqlens_q: int,
-    row_blockmask: Tensor,
-    threshold: float = -1.0,
+    block_mask: Optional[Tensor] = None,
+    enable_cosa: bool = False,
+    ordered_block_indices: Optional[Tensor] = None,
+    threshold: Optional[float] = None,
     output: Tensor = None,
 ) -> Tensor:
-    """Any-order block-sparse prefill (paged BF16 KV cache) with dynamic threshold skip.
+    """Unified dense / block-sparse attention prefill with paged BF16 KV cache.
 
-    This op consumes an *ordered* int32 K-block list per row and walks the KV blocks in
-    exactly that order. It additionally supports BLASST-style running-max threshold skipping
-    that drops low-contribution KV tiles at runtime (PV compute is skipped; K/V TMA reads are
-    not).
+    This is the bf16 (no quantization) counterpart of
+    ``attention_with_kvcache_blocksparse_prefill_fp8``. There are three modes,
+    all served by one kernel through compile-time specialisation:
 
-    Two features that are designed to be used together:
+    * ``block_mask=None, enable_cosa=False``: dense-compatible, every causally
+      accessible KV tile is computed.
+    * ``block_mask`` given: only KV tiles marked non-zero are computed, visited
+      in increasing logical order.
+    * ``enable_cosa=True``: CoSA. KV tiles are visited in exactly the order
+      given by ``ordered_block_indices``, and non-diagonal tiles whose scores
+      all fall below ``threshold`` are skipped entirely.
 
-    - Any-order (row-list): ``row_blockmask`` holds, for each (batch, head, local q-tile), the
-      logical K-block indices to compute in order, terminated by the first ``-1``. Example:
-      ``[7, 4, 5, 8, -1, -1, ...]`` computes ``q x k_7, q x k_4, q x k_5, q x k_8``.
-    - Threshold skip: for each non-diagonal tile, the running max ``delta_s`` is compared with a
-      per-batch ``log2_threshold`` computed in-kernel from ``threshold``.
+    ``enable_cosa`` is the only switch that turns CoSA on. It requires both
+    ``ordered_block_indices`` and ``threshold``, and rejects ``block_mask``;
+    conversely those two arguments are rejected when it is False.
 
-    Causality is the caller's responsibility (the diagonal tile uses an element-wise causal mask
-    and is exempt from threshold skip). Keep the diagonal tile in each row-list to avoid a Q-tile
-    with zero active tiles producing softmax(all -inf) = NaN.
+    Recommendation: the causal diagonal tile (the last KV tile in each Q-tile's
+    causal range) should be selected — non-zero in ``block_mask``, or present in
+    ``ordered_block_indices`` — to avoid NaN, since a Q-tile with zero active
+    tiles yields softmax(all -inf) = NaN. Diagonal tiles are never
+    threshold-skipped.
 
     Args:
         q: Query tensor. Shape: [total_seq, num_head_q, num_dim_qk], Dtype: bfloat16
         kcache: Paged K cache. Logical shape:
-            [num_blocks, block_size, num_head_kv, num_dim_qk]. Dtype: bfloat16
+            [num_blocks, block_size, num_head_kv, num_dim_qk]. Both NHD-contiguous
+            and stride-transformed HND-backed layouts are supported. Dtype: bfloat16
         vcache: Paged V cache. Logical shape:
             [num_blocks, block_size, num_head_kv, num_dim_v]. Dtype: bfloat16
         cu_seqlens_q: Cumulative Q lengths. Shape: [num_batch + 1], Dtype: int32
         block_ids: Page table. Shape: [num_batch, max_blocks], Dtype: int32
         seqlens_kvcache: KV cache lengths. Shape: [num_batch], Dtype: int32
         max_seqlens_q: Max Q sequence length (scalar).
-        row_blockmask: Ordered logical K-block indices, ``-1`` padded. Shape:
-            [num_batch, num_head_q, ceil(max_seqlens_q / 128), num_k_block], Dtype: int32.
-            The K-block granularity is kTileN=128 (num_k_block = ceil(max_kv_len / 128)).
-        threshold: Raw scale factor. ``< 0`` disables skipping; ``>= 0`` enables it (``0`` is
-            equivalent to no skipping). Converted in-kernel per batch as
-            ``log2(min(threshold / num_seq_kv, 0.1))``.
+        block_mask: Optional mask for KV tiles. Non-zero = compute, zero = skip.
+            Shape: [num_batch, num_head_q, max_tile_m, num_tile_kv_in_mask], Dtype: uint8.
+            The KV-tile granularity is kTileN=128 (Kb = ceil(max_kv_len / 128)).
+            Mutually exclusive with ``enable_cosa``.
+        enable_cosa: Enable CoSA (ordered-list access plus threshold skip).
+        ordered_block_indices: Ordered KV tile indices, required when
+            ``enable_cosa`` is True. Shape:
+            [num_batch, num_head_q, max_tile_m, Kb], Dtype: int32. Each row is
+            read in order and terminates at the first negative entry, so rows
+            shorter than Kb are padded with -1. Indices are at kTileN=128
+            granularity.
+        threshold: Raw threshold, required when ``enable_cosa`` is True. Must be
+            finite and >= 0. It is normalised per request by the KV length in
+            kernel. ``threshold=0`` never skips anything but still runs the vote,
+            so it does not exercise the skip path.
         output: Optional pre-allocated output tensor.
 
     Returns:
         Tensor: Shape [total_seq, num_head_q, num_dim_v], Dtype: bfloat16.
     """
-    return torch.ops.hpc.attention_with_kvcache_blocksparse_anyorderskip_prefill_bf16(
+    return torch.ops.hpc.attention_with_kvcache_blocksparse_prefill_bf16(
         q,
         kcache,
         vcache,
@@ -205,7 +222,9 @@ def attention_with_kvcache_blocksparse_anyorderskip_prefill_bf16(
         block_ids,
         seqlens_kvcache,
         max_seqlens_q,
-        row_blockmask,
+        block_mask,
+        enable_cosa,
+        ordered_block_indices,
         threshold,
         output,
     )
@@ -776,8 +795,8 @@ def attention_with_kvcache_prefill_bf16_fake(
     )
 
 
-@torch.library.register_fake("hpc::attention_with_kvcache_blocksparse_anyorderskip_prefill_bf16")
-def attention_with_kvcache_blocksparse_anyorderskip_prefill_bf16_fake(
+@torch.library.register_fake("hpc::attention_with_kvcache_blocksparse_prefill_bf16")
+def attention_with_kvcache_blocksparse_prefill_bf16_fake(
     q,
     kcache,
     vcache,
@@ -785,8 +804,10 @@ def attention_with_kvcache_blocksparse_anyorderskip_prefill_bf16_fake(
     block_ids,
     seqlens_kvcache,
     max_seqlens_q,
-    row_blockmask,
-    threshold=-1.0,
+    block_mask=None,
+    enable_cosa=False,
+    ordered_block_indices=None,
+    threshold=None,
     output=None,
 ):
     return torch.empty(
