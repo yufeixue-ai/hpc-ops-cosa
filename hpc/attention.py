@@ -145,6 +145,61 @@ def attention_with_kvcache_prefill_bf16(
     )
 
 
+def attention_with_kvcache_blocksparse_prefill_bf16(
+    q: Tensor,
+    kcache: Tensor,
+    vcache: Tensor,
+    cu_seqlens_q: Tensor,
+    block_ids: Tensor,
+    seqlens_kvcache: Tensor,
+    max_seqlens_q: int,
+    block_mask: Optional[Tensor] = None,
+    output: Tensor = None,
+) -> Tensor:
+    """Unified dense / block-sparse attention prefill with paged BF16 KV cache.
+
+    This is the bf16 (no quantization) counterpart of
+    ``attention_with_kvcache_blocksparse_prefill_fp8``. When ``block_mask`` is
+    None, it dispatches to the dense-compatible ``kHasMask=False`` path inside
+    the unified kernel. When provided, only KV tiles marked non-zero in
+    ``block_mask`` are computed.
+
+    Recommendation: the causal diagonal tile (the last KV tile in each Q-tile's
+    causal range) should be non-zero in ``block_mask`` to avoid NaN, since a
+    Q-tile with zero active tiles yields softmax(all -inf) = NaN.
+
+    Args:
+        q: Query tensor. Shape: [total_seq, num_head_q, num_dim_qk], Dtype: bfloat16
+        kcache: Paged K cache. Logical shape:
+            [num_blocks, block_size, num_head_kv, num_dim_qk]. Both NHD-contiguous
+            and stride-transformed HND-backed layouts are supported. Dtype: bfloat16
+        vcache: Paged V cache. Logical shape:
+            [num_blocks, block_size, num_head_kv, num_dim_v]. Dtype: bfloat16
+        cu_seqlens_q: Cumulative Q lengths. Shape: [num_batch + 1], Dtype: int32
+        block_ids: Page table. Shape: [num_batch, max_blocks], Dtype: int32
+        seqlens_kvcache: KV cache lengths. Shape: [num_batch], Dtype: int32
+        max_seqlens_q: Max Q sequence length (scalar).
+        block_mask: Optional mask for KV tiles. Non-zero = compute, zero = skip.
+            Shape: [num_batch, num_head_q, max_tile_m, num_tile_kv_in_mask], Dtype: uint8.
+            The KV-tile granularity is kTileN=128 (Kb = ceil(max_kv_len / 128)).
+        output: Optional pre-allocated output tensor.
+
+    Returns:
+        Tensor: Shape [total_seq, num_head_q, num_dim_v], Dtype: bfloat16.
+    """
+    return torch.ops.hpc.attention_with_kvcache_blocksparse_prefill_bf16(
+        q,
+        kcache,
+        vcache,
+        cu_seqlens_q,
+        block_ids,
+        seqlens_kvcache,
+        max_seqlens_q,
+        block_mask,
+        output,
+    )
+
+
 def attention_with_kvcache_prefill_fp8(
     q: Tensor,
     kcache: Tensor,
@@ -704,6 +759,23 @@ def attention_prefill_bf16_fake(q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q,
 @torch.library.register_fake("hpc::attention_with_kvcache_prefill_bf16")
 def attention_with_kvcache_prefill_bf16_fake(
     q, kcache, vcache, cu_seqlens_q, block_ids, seqlens_kvcache, max_seqlens_q, output
+):
+    return torch.empty(
+        (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device
+    )
+
+
+@torch.library.register_fake("hpc::attention_with_kvcache_blocksparse_prefill_bf16")
+def attention_with_kvcache_blocksparse_prefill_bf16_fake(
+    q,
+    kcache,
+    vcache,
+    cu_seqlens_q,
+    block_ids,
+    seqlens_kvcache,
+    max_seqlens_q,
+    block_mask=None,
+    output=None,
 ):
     return torch.empty(
         (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device
