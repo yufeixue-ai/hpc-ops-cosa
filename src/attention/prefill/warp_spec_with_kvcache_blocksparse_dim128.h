@@ -16,7 +16,8 @@ void warp_spec_with_kvcache_blocksparse_dim128_async(
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int num_dim_qk, int num_dim_v,
     int num_head_q, int num_head_kv, int num_kvcache_blocks, int block_size, int num_seq_max_blocks,
     int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV, int ldV1, int ldV2,
-    const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream);
+    const void *block_mask_ptr, int num_tile_kv_in_mask, const void *ordered_block_indices_ptr,
+    int num_ordered_k_tile, bool enable_cosa, float threshold, cudaStream_t stream);
 
 }  // namespace prefill
 }  // namespace attention

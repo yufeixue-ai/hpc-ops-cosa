@@ -254,7 +254,7 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_bf16_entry(
       y_ptr, q_ptr, kcache_ptr, vcache_ptr, cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr,
       tmas_ptr, num_batch, total_seq_q, max_seqlens_q, num_dim_qk, num_dim_v, num_head_q,
       num_head_kv, num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2,
-      ldV, ldV1, ldV2, block_mask_ptr, num_tile_kv_in_mask, stream);
+      ldV, ldV1, ldV2, block_mask_ptr, num_tile_kv_in_mask, nullptr, 0, false, 0.f, stream);
 
   return y;
 }

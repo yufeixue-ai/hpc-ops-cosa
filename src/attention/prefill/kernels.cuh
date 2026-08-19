@@ -44,6 +44,17 @@ __device__ __forceinline__ auto get_next_tile(const int *seqlens_q_ptr, int &ibl
   return cute::make_tuple(itile_m, ihead_q, ibatch);
 }
 
+// A KV tile is "diagonal" when it can contain this Q tile's causal boundary. Diagonal tiles keep
+// the element-wise causal mask and are exempt from the CoSA threshold skip.
+//
+// The producer and both consumer warpgroups must evaluate this with byte-identical inputs: it
+// gates how many times each side enters the threshold-vote named barrier, and a disagreement
+// leaves one side waiting forever. Keeping it in one helper is what makes that structural.
+template <int kTileM, int kTileN>
+__device__ __forceinline__ bool is_diag_tile(int itile_seq_kv, int start_seq_q, int itile_m) {
+  return itile_seq_kv >= (start_seq_q + itile_m * kTileM) / kTileN;
+}
+
 template <typename YTensor, typename STensor>
 __device__ __forceinline__ void final_online_softmax(YTensor &&tYr_mn, STensor &&gSum, int kM) {
 #pragma unroll
@@ -965,8 +976,12 @@ __global__ void __launch_bounds__(384, 1)
 
 // BF16 warp-specialization kernel with paged KV cache and Block-Sparse Attention support,
 // dim_qk=128, dim_v=128.
+// - kHasMask: upstream binary uint8 block mask; KV tiles are visited in logical order.
+// - kEnableCosa: CoSA mode. The caller supplies an ordered int32 KV tile list and a threshold;
+//   tiles are visited in exactly the given order and non-diagonal tiles may be skipped by a
+//   128-row threshold vote.
 template <typename Config, typename TmaQ, typename TmaK, typename TmaV, typename TmaY,
-          bool kHasMask>
+          bool kHasMask, bool kEnableCosa>
 __global__ void __launch_bounds__(384, 1)
     attention_with_kvcache_blocksparse_prefill_bf16_warp_specialization_kernel(
         cute::TmaDescriptor *td_qy, const __grid_constant__ TmaK tma_k,
@@ -975,8 +990,17 @@ __global__ void __launch_bounds__(384, 1)
         int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
         int block_size, int num_seq_max_blocks, float one_over_dk_log2e,
         cutlass::FastDivmod head_kv_divmod, cutlass::FastDivmod head_q_divmod,
-        cutlass::FastDivmod tile_m_divmod, const uint8_t *block_mask_ptr, int num_tile_kv_in_mask) {
+        cutlass::FastDivmod tile_m_divmod, const uint8_t *block_mask_ptr, int num_tile_kv_in_mask,
+        const int32_t *ordered_block_indices_ptr, int num_ordered_k_tile, float threshold) {
   using namespace cute;  // NOLINT
+
+  static_assert(!(kHasMask && kEnableCosa),
+                "block_mask and the CoSA ordered list both select KV tiles; enabling both has no "
+                "defined semantics");
+
+  // Both modes express the tile order through shm_active_tiles, so the consumer only needs one
+  // predicate to decide whether to read the list.
+  constexpr bool kUseTileList = kHasMask || kEnableCosa;
 
   using Tin = typename Config::Tin;
   using Tout = typename Config::Tout;
@@ -1022,6 +1046,13 @@ __global__ void __launch_bounds__(384, 1)
   // Active tile list: [num_tile_active (int)] [tile_indices (int[])]
   auto *shm_num_active = reinterpret_cast<int *>(shm_seqlens_qstart + num_batch);
   auto *shm_active_tiles = shm_num_active + 1;
+  // Per-warp skip vote slots (2 warpgroups x 4 warps), placed right after the tile list. The
+  // launcher reserves (num_ordered_k_tile + 2) ints for the list, so this offset is the first
+  // free slot. Only the CoSA instance pays for it.
+  uint32_t *skip_vote = nullptr;
+  if constexpr (kEnableCosa) {
+    skip_vote = reinterpret_cast<uint32_t *>(shm_active_tiles + num_ordered_k_tile + 1);
+  }
 
   TmaQ tma_q;
   TmaY tma_y;
@@ -1115,7 +1146,6 @@ __global__ void __launch_bounds__(384, 1)
     idx -= 256;
 
     int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
-    int idx_in_warp = idx % 32;
 
     // 32 lanes enter for warp-parallel mask scan; single-thread ops guarded by `if (elected)`.
     if (iwarp == 0) {
@@ -1163,6 +1193,7 @@ __global__ void __launch_bounds__(384, 1)
           wait_barrier(writable_list, phase_list_w);
           phase_list_w ^= 1;
 
+          int idx_in_warp = idx % 32;
           int block_mask_offset = ibatch * (num_head_q * max_num_tile_m * num_tile_kv_in_mask) +
                                   ihead_q * (max_num_tile_m * num_tile_kv_in_mask) +
                                   itile_m * num_tile_kv_in_mask;
@@ -1195,6 +1226,30 @@ __global__ void __launch_bounds__(384, 1)
             *shm_num_active = num_tile_active;
           }
           arrive_barrier(readable_list);
+        } else if constexpr (kEnableCosa) {
+          wait_barrier(writable_list, phase_list_w);
+          phase_list_w ^= 1;
+
+          int row_off = (ibatch * num_head_q + ihead_q) * (max_num_tile_m * num_ordered_k_tile) +
+                        itile_m * num_ordered_k_tile;
+          // One elected lane copies the list so the caller-provided order survives verbatim; the
+          // list terminates at the first negative entry.
+          if (elected) {
+            int n = 0;
+#pragma unroll 1
+            for (int j = 0; j < num_ordered_k_tile; ++j) {
+              int v = ordered_block_indices_ptr[row_off + j];
+              if (v < 0) {
+                break;
+              }
+              shm_active_tiles[n] = v;
+              ++n;
+            }
+            *shm_num_active = n;
+          }
+          __syncwarp();
+          num_tile_active = *shm_num_active;
+          arrive_barrier(readable_list);
         }
 
         if (elected) {
@@ -1205,7 +1260,7 @@ __global__ void __launch_bounds__(384, 1)
 #pragma unroll 1
         for (int i_active = 0; i_active < num_tile_active; ++i_active) {
           int itile_seq_kv;
-          if constexpr (kHasMask) {
+          if constexpr (kUseTileList) {
             itile_seq_kv = shm_active_tiles[i_active];
           } else {
             itile_seq_kv = i_active;
@@ -1250,6 +1305,19 @@ __global__ void __launch_bounds__(384, 1)
           if (ismem_write == kStage) {
             ismem_write = 0;
             phase ^= 1;
+          }
+
+          if constexpr (kEnableCosa) {
+            // The producer joins the consumers' vote rendezvous. A consumer-only barrier
+            // deadlocks: WG0 waits for WG1's vote, WG1 waits for readable_k, the producer waits
+            // for WG0 to release writable_v, and the cycle closes. Joining here -- after this
+            // tile's K/V loads have been issued -- breaks it.
+            // Two rendezvous per voting tile, matching the consumers exactly. Barrier id 10,
+            // 288 threads = 256 consumers + this warp's 32.
+            if (!is_diag_tile<kTileM, kTileN>(itile_seq_kv, start_seq_q, itile_m)) {
+              asm volatile("barrier.sync 10, 288;\n" ::: "memory");
+              asm volatile("barrier.sync 10, 288;\n" ::: "memory");
+            }
           }
         }
         __syncwarp();
@@ -1302,7 +1370,15 @@ __global__ void __launch_bounds__(384, 1)
       int ihead_kv, res;
       head_kv_divmod(ihead_kv, res, ihead_q);
       int num_tile_kv = (start_seq_q + (itile_m + 1) * kTileM + kTileN - 1) / kTileN;
-      int num_tile_full = (start_seq_q + itile_m * kTileM) / kTileN;
+
+      // Per-batch conversion: the caller's raw threshold is normalised by this request's KV
+      // length and compared in the same scaled base-2 units the online softmax keeps its running
+      // max in. threshold == 0 gives -inf, i.e. nothing is ever skipped, but the vote and its two
+      // barriers still run -- that is why threshold=0 is not a valid stress-test configuration.
+      [[maybe_unused]] float log2_threshold = 0.f;
+      if constexpr (kEnableCosa) {
+        log2_threshold = log2f(fminf(threshold / static_cast<float>(num_seq_kv), 0.1f));
+      }
 
       clear(tYr);
       clear(gSum);
@@ -1311,7 +1387,7 @@ __global__ void __launch_bounds__(384, 1)
       wait_barrier(readable_q, phase_q);
 
       int num_tile_active;
-      if constexpr (kHasMask) {
+      if constexpr (kUseTileList) {
         wait_barrier(readable_list, phase_list);
         phase_list ^= 1;
         num_tile_active = *shm_num_active;
@@ -1322,7 +1398,7 @@ __global__ void __launch_bounds__(384, 1)
 #pragma unroll 1
       for (int i_active = 0; i_active < num_tile_active; ++i_active) {
         int itile_seq_kv;
-        if constexpr (kHasMask) {
+        if constexpr (kUseTileList) {
           itile_seq_kv = shm_active_tiles[i_active];
         } else {
           itile_seq_kv = i_active;
@@ -1354,15 +1430,16 @@ __global__ void __launch_bounds__(384, 1)
             arrive_barrier(writable_q);
           }
           phase_q ^= 1;
-          if constexpr (kHasMask) {
+          if constexpr (kUseTileList) {
             arrive_barrier(writable_list);
           }
         }
 
-        // do causal mask
+        // do causal mask (diagonal tiles only; non-diagonal tiles are fully valid)
         auto tI_mn = retile_fragment(tI);
+        bool is_diag = is_diag_tile<kTileM, kTileN>(itile_seq_kv, start_seq_q, itile_m);
 
-        if (itile_seq_kv >= num_tile_full) {
+        if (is_diag) {
 #pragma unroll
           for (int im = 0; im < kM; ++im) {
 #pragma unroll
@@ -1374,6 +1451,59 @@ __global__ void __launch_bounds__(384, 1)
                 tAttr_mn(im, in) = -std::numeric_limits<float>::infinity();
               }
             }
+          }
+        }
+
+        if constexpr (kEnableCosa) {
+          bool skip = false;
+          if (!is_diag) {
+            // The skip decision must be identical for all 128 rows of the Q tile, matching the
+            // reference's single max-over-rows test at BLOCK_M=128. Each of the 8 warps (2
+            // warpgroups x 4 warps) owns 16 rows: it ANDs its own rows, publishes one vote, and
+            // then every thread ANDs all 8 votes. A tile is skipped only when all 128 rows are
+            // below the threshold.
+            bool warp_skip = true;
+#pragma unroll
+            for (int im = 0; im < kM; ++im) {
+              float row_max = tAttr_mn(im, 0);
+#pragma unroll
+              for (int in = 1; in < kN; ++in) {
+                row_max = fmaxf(row_max, tAttr_mn(im, in));
+              }
+              // Same scaling as online_softmax: max(qk) * one_over_dk_log2e, base-2, pre-exp.
+              row_max = warp_4lane_reduce_max_xor(row_max) * one_over_dk_log2e;
+              warp_skip &= ((row_max - gMax(im)) < log2_threshold);
+            }
+            // Hardware warp-wide AND: all 32 lanes of the warp end up with the same value.
+            warp_skip = __all_sync(0xFFFFFFFF, warp_skip);
+
+            if (elected) {
+              reinterpret_cast<volatile uint32_t *>(
+                  skip_vote)[iwarpgroup * 4 + iwarp_in_warpgroup] = warp_skip ? 1u : 0u;
+            }
+            __threadfence_block();
+            // Producer warp 0 joins both of these; see the producer comment for why 288 and not
+            // 256. First rendezvous: every vote has been written. Second: every vote has been
+            // read, so the slots can be reused by the next tile.
+            asm volatile("barrier.sync 10, 288;\n" ::: "memory");
+            volatile uint32_t *v = skip_vote;
+            uint32_t all_skip = v[0] & v[1] & v[2] & v[3] & v[4] & v[5] & v[6] & v[7];
+            skip = (all_skip != 0u);
+            asm volatile("barrier.sync 10, 288;\n" ::: "memory");
+          }
+
+          if (skip) {
+            // Free the V stage and advance the pipeline; never touch m/l/acc.
+            wait_barrier(readable_v[ismem_read], phase);
+            if (elected_idx_in_warpgroup) {
+              arrive_barrier(writable_v[ismem_read]);
+            }
+            ++ismem_read;
+            if (ismem_read == kStage) {
+              phase ^= 1;
+              ismem_read = 0;
+            }
+            continue;
           }
         }
 
@@ -1407,12 +1537,18 @@ __global__ void __launch_bounds__(384, 1)
         }
       }
 
-      // Release Q barrier to prevent deadlock if all tiles masked out.
+      // Release the Q and list barriers when this Q tile has no active KV tile at all. Without
+      // the writable_list arrival the producer blocks on its next wait_barrier(writable_list),
+      // because that barrier expects 256 consumer arrivals per Q tile and the per-tile loop --
+      // which is where the arrival normally happens -- never ran.
       if (num_tile_active == 0) {
         if (elected_idx_in_warpgroup) {
           arrive_barrier(writable_q);
         }
         phase_q ^= 1;
+        if constexpr (kUseTileList) {
+          arrive_barrier(writable_list);
+        }
       }
 
       auto tYr_mn = retile_fragment(tYr);
