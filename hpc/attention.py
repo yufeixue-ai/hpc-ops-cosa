@@ -154,19 +154,34 @@ def attention_with_kvcache_blocksparse_prefill_bf16(
     seqlens_kvcache: Tensor,
     max_seqlens_q: int,
     block_mask: Optional[Tensor] = None,
+    enable_cosa: bool = False,
+    ordered_block_indices: Optional[Tensor] = None,
+    threshold: Optional[float] = None,
     output: Tensor = None,
 ) -> Tensor:
     """Unified dense / block-sparse attention prefill with paged BF16 KV cache.
 
     This is the bf16 (no quantization) counterpart of
-    ``attention_with_kvcache_blocksparse_prefill_fp8``. When ``block_mask`` is
-    None, it dispatches to the dense-compatible ``kHasMask=False`` path inside
-    the unified kernel. When provided, only KV tiles marked non-zero in
-    ``block_mask`` are computed.
+    ``attention_with_kvcache_blocksparse_prefill_fp8``. There are three modes,
+    all served by one kernel through compile-time specialisation:
+
+    * ``block_mask=None, enable_cosa=False``: dense-compatible, every causally
+      accessible KV tile is computed.
+    * ``block_mask`` given: only KV tiles marked non-zero are computed, visited
+      in increasing logical order.
+    * ``enable_cosa=True``: CoSA. KV tiles are visited in exactly the order
+      given by ``ordered_block_indices``, and non-diagonal tiles whose scores
+      all fall below ``threshold`` are skipped entirely.
+
+    ``enable_cosa`` is the only switch that turns CoSA on. It requires both
+    ``ordered_block_indices`` and ``threshold``, and rejects ``block_mask``;
+    conversely those two arguments are rejected when it is False.
 
     Recommendation: the causal diagonal tile (the last KV tile in each Q-tile's
-    causal range) should be non-zero in ``block_mask`` to avoid NaN, since a
-    Q-tile with zero active tiles yields softmax(all -inf) = NaN.
+    causal range) should be selected — non-zero in ``block_mask``, or present in
+    ``ordered_block_indices`` — to avoid NaN, since a Q-tile with zero active
+    tiles yields softmax(all -inf) = NaN. Diagonal tiles are never
+    threshold-skipped.
 
     Args:
         q: Query tensor. Shape: [total_seq, num_head_q, num_dim_qk], Dtype: bfloat16
@@ -182,6 +197,18 @@ def attention_with_kvcache_blocksparse_prefill_bf16(
         block_mask: Optional mask for KV tiles. Non-zero = compute, zero = skip.
             Shape: [num_batch, num_head_q, max_tile_m, num_tile_kv_in_mask], Dtype: uint8.
             The KV-tile granularity is kTileN=128 (Kb = ceil(max_kv_len / 128)).
+            Mutually exclusive with ``enable_cosa``.
+        enable_cosa: Enable CoSA (ordered-list access plus threshold skip).
+        ordered_block_indices: Ordered KV tile indices, required when
+            ``enable_cosa`` is True. Shape:
+            [num_batch, num_head_q, max_tile_m, Kb], Dtype: int32. Each row is
+            read in order and terminates at the first negative entry, so rows
+            shorter than Kb are padded with -1. Indices are at kTileN=128
+            granularity.
+        threshold: Raw threshold, required when ``enable_cosa`` is True. Must be
+            finite and >= 0. It is normalised per request by the KV length in
+            kernel. ``threshold=0`` never skips anything but still runs the vote,
+            so it does not exercise the skip path.
         output: Optional pre-allocated output tensor.
 
     Returns:
@@ -196,6 +223,9 @@ def attention_with_kvcache_blocksparse_prefill_bf16(
         seqlens_kvcache,
         max_seqlens_q,
         block_mask,
+        enable_cosa,
+        ordered_block_indices,
+        threshold,
         output,
     )
 
@@ -775,6 +805,9 @@ def attention_with_kvcache_blocksparse_prefill_bf16_fake(
     seqlens_kvcache,
     max_seqlens_q,
     block_mask=None,
+    enable_cosa=False,
+    ordered_block_indices=None,
+    threshold=None,
     output=None,
 ):
     return torch.empty(

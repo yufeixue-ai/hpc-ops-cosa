@@ -5,6 +5,8 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <cmath>
+
 #include "src/attention/decode/decode.h"
 #include "src/attention/prefill/prefill.h"
 #include "src/utils/utils.h"
@@ -153,7 +155,9 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_bf16_entry(
     const torch::Tensor &q, const torch::Tensor &kcache, const torch::Tensor &vcache,
     const torch::Tensor &cu_seqlens_q, const torch::Tensor block_ids,
     const torch::Tensor seqlens_kvcache, int64_t max_seqlens_q,
-    std::optional<torch::Tensor> block_mask, std::optional<torch::Tensor> output) {
+    std::optional<torch::Tensor> block_mask, bool enable_cosa,
+    std::optional<torch::Tensor> ordered_block_indices, std::optional<double> threshold,
+    std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
   TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
   TORCH_CHECK(kcache.device().is_cuda(), "kcache tensor must be cuda");
@@ -166,6 +170,21 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_bf16_entry(
   TORCH_CHECK(vcache.scalar_type() == torch::kBFloat16, "vcache dtype must be bfloat16");
 
   bool has_block_mask = block_mask.has_value();
+
+  // enable_cosa is the only switch that turns CoSA on; the ordered list and the threshold are
+  // required exactly when it is set, and never accepted otherwise.
+  if (enable_cosa) {
+    TORCH_CHECK(ordered_block_indices.has_value(),
+                "enable_cosa=True requires ordered_block_indices");
+    TORCH_CHECK(threshold.has_value(), "enable_cosa=True requires threshold");
+    TORCH_CHECK(!has_block_mask,
+                "block_mask and CoSA both select KV tiles; enable_cosa=True is incompatible with "
+                "block_mask");
+  } else {
+    TORCH_CHECK(!ordered_block_indices.has_value(),
+                "ordered_block_indices is only accepted with enable_cosa=True");
+    TORCH_CHECK(!threshold.has_value(), "threshold is only accepted with enable_cosa=True");
+  }
 
   int total_seq_q = q.size(0);
   int num_head_q = q.size(1);
@@ -208,6 +227,29 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_bf16_entry(
     TORCH_CHECK(num_tile_kv_in_mask > 0, "block_mask Kb dim must be > 0");
   }
 
+  int num_ordered_k_tile = 0;
+  float threshold_value = 0.f;
+  if (enable_cosa) {
+    const auto &list_tensor = ordered_block_indices.value();
+    TORCH_CHECK(list_tensor.device() == q.device(),
+                "ordered_block_indices tensor must be on the same device as q");
+    TORCH_CHECK(list_tensor.scalar_type() == torch::kInt32,
+                "ordered_block_indices dtype must be int32");
+    TORCH_CHECK(list_tensor.is_contiguous(), "ordered_block_indices tensor must be contiguous");
+    TORCH_CHECK(list_tensor.dim() == 4 && list_tensor.size(0) == num_batch &&
+                    list_tensor.size(1) == num_head_q &&
+                    list_tensor.size(2) == expected_max_num_tile_m,
+                "ordered_block_indices must have shape [", num_batch, ", ", num_head_q, ", ",
+                expected_max_num_tile_m, ", Kb] where Kb = ceil(max_kv_len / kTileN=", kTileN, ")");
+    num_ordered_k_tile = list_tensor.size(3);
+    TORCH_CHECK(num_ordered_k_tile > 0, "ordered_block_indices Kb dim must be > 0");
+
+    double threshold_raw = threshold.value();
+    TORCH_CHECK(std::isfinite(threshold_raw) && threshold_raw >= 0.0,
+                "threshold must be finite and >= 0, got ", threshold_raw);
+    threshold_value = static_cast<float>(threshold_raw);
+  }
+
   auto options = q.options().dtype(torch::kBFloat16);
   torch::Tensor y;
   if (output.has_value()) {
@@ -236,6 +278,10 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_bf16_entry(
   if (has_block_mask) {
     block_mask_ptr = block_mask.value().const_data_ptr();
   }
+  const void *ordered_block_indices_ptr = nullptr;
+  if (enable_cosa) {
+    ordered_block_indices_ptr = ordered_block_indices.value().const_data_ptr();
+  }
   void *tmas_ptr = tmas.mutable_data_ptr();
 
   using T = __nv_bfloat16;
@@ -254,7 +300,8 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_bf16_entry(
       y_ptr, q_ptr, kcache_ptr, vcache_ptr, cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr,
       tmas_ptr, num_batch, total_seq_q, max_seqlens_q, num_dim_qk, num_dim_v, num_head_q,
       num_head_kv, num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2,
-      ldV, ldV1, ldV2, block_mask_ptr, num_tile_kv_in_mask, nullptr, 0, false, 0.f, stream);
+      ldV, ldV1, ldV2, block_mask_ptr, num_tile_kv_in_mask, ordered_block_indices_ptr,
+      num_ordered_k_tile, enable_cosa, threshold_value, stream);
 
   return y;
 }
@@ -945,7 +992,8 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "attention_with_kvcache_blocksparse_prefill_bf16(Tensor q, Tensor kcache, Tensor vcache,"
       "Tensor cu_seqlens_q, Tensor block_ids, Tensor num_seq_kvcache, int max_seqlens_q,"
-      "Tensor? block_mask, Tensor? output) -> (Tensor)");
+      "Tensor? block_mask, bool enable_cosa, Tensor? ordered_block_indices, float? threshold,"
+      "Tensor? output) -> (Tensor)");
   m.impl("attention_with_kvcache_blocksparse_prefill_bf16", torch::kCUDA,
          &hpc::attention::attention_with_kvcache_blocksparse_prefill_bf16_entry);
 
